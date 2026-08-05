@@ -1,3 +1,6 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch.nn as nn
 
 from model import Model
@@ -25,11 +28,14 @@ parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--embedding_dim', type=int, default=300)
 parser.add_argument('--num_epoch', type=int)
 parser.add_argument('--drop_prob', type=float, default=0.0)
+parser.add_argument('--rate', type=float, default=0.5)
+parser.add_argument('--outlier_ratio', type=float, default=0.15)
 parser.add_argument('--readout', type=str, default='avg')  # max min avg  weighted_sum
 parser.add_argument('--auc_test_rounds', type=int, default=256)
 parser.add_argument('--negsamp_ratio', type=int, default=1)
 parser.add_argument('--mean', type=float, default=0.0)
 parser.add_argument('--var', type=float, default=0.0)
+parser.add_argument('--backbone', type=str, default='gcn')
 
 
 
@@ -81,15 +87,21 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # Load and preprocess data
+# adj, features, labels, all_idx, idx_train, idx_val, \
+# idx_test, ano_label, str_ano_label, attr_ano_label, normal_label_idx, abnormal_label_idx = load_mat(args.dataset)
+
+# adj, features, labels, all_idx, idx_train, idx_val, \
+# idx_test, ano_label, str_ano_label, attr_ano_label, normal_label_idx, abnormal_label_idx = load_mat(args.dataset, rate=args.rate)
+
 adj, features, labels, all_idx, idx_train, idx_val, \
-idx_test, ano_label, str_ano_label, attr_ano_label, normal_label_idx, abnormal_label_idx = load_mat(args.dataset)
+idx_test, ano_label, str_ano_label, attr_ano_label, normal_label_idx, abnormal_label_idx = load_mat(args.dataset, rate=args.rate, outlier_ratio=args.outlier_ratio)
 
 if args.dataset in ['Amazon', 'tf_finace', 'reddit', 'elliptic']:
     features, _ = preprocess_features(features)
 else:
     features = features.todense()
 
-dgl_graph = adj_to_dgl_graph(adj)
+#dgl_graph = adj_to_dgl_graph(adj)
 
 nb_nodes = features.shape[0]
 ft_size = features.shape[1]
@@ -114,7 +126,8 @@ labels = torch.FloatTensor(labels[np.newaxis])
 # idx_test = torch.LongTensor(idx_test)
 
 # Initialize model and optimiser
-model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout)
+# model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout)
+model = Model(ft_size, args.embedding_dim, 'prelu', args.negsamp_ratio, args.readout, backbone=args.backbone)
 optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 #
 # if torch.cuda.is_available():
@@ -238,3 +251,56 @@ with tqdm(total=args.num_epoch) as pbar:
             print('Testing {} AUC:{:.4f}'.format(args.dataset, auc))
             AP = average_precision_score(ano_label[idx_test], logits, average='macro', pos_label=1, sample_weight=None)
             print('Testing AP:', AP)
+
+# Final evaluation and save results
+model.eval()
+train_flag = False
+emb, emb_combine, logits, emb_con, emb_abnormal = model(features, adj, abnormal_label_idx, normal_label_idx, train_flag, args)
+logits_final = np.squeeze(logits[:, idx_test, :].cpu().detach().numpy())
+final_auc = roc_auc_score(ano_label[idx_test], logits_final)
+final_ap = average_precision_score(ano_label[idx_test], logits_final, average='macro', pos_label=1, sample_weight=None)
+
+print('\n===== FINAL RESULTS =====')
+print(f'Dataset: {args.dataset}, Rate: {args.rate}, Seed: {args.seed}')
+print(f'AUROC: {final_auc:.4f}')
+print(f'AP: {final_ap:.4f}')
+print('========================\n')
+
+# ============ SAVE EMBEDDINGS FOR UMAP ============
+print("Saving embeddings for UMAP visualization...")
+model.eval()
+train_flag = True  # Need this to generate outliers
+emb, emb_combine, logits, emb_con, emb_abnormal = model(features, adj, abnormal_label_idx, normal_label_idx, train_flag, args)
+
+# Get embeddings as numpy arrays
+all_embeddings = emb.squeeze(0).cpu().detach().numpy()  # All node embeddings
+
+# Normal node embeddings (labeled normals)
+normal_emb = all_embeddings[normal_label_idx]
+
+# Generated outlier embeddings
+outlier_emb = emb_con.cpu().detach().numpy()
+
+# Real anomaly embeddings (from test set where ano_label == 1)
+real_anomaly_idx = [i for i in idx_test if ano_label[i] == 1]
+real_anomaly_emb = all_embeddings[real_anomaly_idx]
+
+# Save to files
+os.makedirs('embeddings', exist_ok=True)
+np.save(f'embeddings/{args.dataset}_{args.backbone}_normal.npy', normal_emb)
+np.save(f'embeddings/{args.dataset}_{args.backbone}_outlier.npy', outlier_emb)
+np.save(f'embeddings/{args.dataset}_{args.backbone}_anomaly.npy', real_anomaly_emb)
+print(f"Embeddings saved: {normal_emb.shape[0]} normals, {outlier_emb.shape[0]} outliers, {real_anomaly_emb.shape[0]} real anomalies")
+# ============ END SAVE EMBEDDINGS ============
+
+import csv
+results_file = 'results/results.csv'
+os.makedirs('results', exist_ok=True)
+file_exists = os.path.isfile(results_file)
+with open(results_file, 'a', newline='') as f:
+    writer = csv.writer(f)
+    if not file_exists:
+        writer.writerow(['dataset', 'rate', 'outlier_ratio', 'backbone', 'seed', 'auroc', 'ap'])
+    writer.writerow([args.dataset, args.rate, args.outlier_ratio, args.backbone, args.seed, f'{final_auc:.4f}', f'{final_ap:.4f}'])
+
+print(f'Results saved to {results_file}')
